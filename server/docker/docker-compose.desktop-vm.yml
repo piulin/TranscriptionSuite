@@ -11,3 +11,8 @@ services:
     environment:
       # Override LM Studio URL to use Docker Desktop's host gateway
       - LM_STUDIO_URL=${LM_STUDIO_URL:-http://host.docker.internal:1234}
+    # host-gateway is a Docker Engine 20.10+ feature; a compatible no-op under
+    # Docker Desktop, but required for host.docker.internal to resolve under a
+    # bare Docker Engine (e.g. WSL2 without Desktop).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
