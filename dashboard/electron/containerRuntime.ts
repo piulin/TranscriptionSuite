@@ -25,6 +25,16 @@ const execFileAsync = promisify(execFile);
 
 export type ContainerRuntimeKind = 'docker' | 'podman';
 
+/**
+ * Finer-grained engine classification than {@link ContainerRuntimeKind}
+ * (Issue #2). A bare Docker Engine running inside a WSL2 distro (no Docker
+ * Desktop) is reached from Windows via `docker.exe` over
+ * `DOCKER_HOST=tcp://...` — the same `kind: 'docker'` as Docker Desktop, but
+ * with different bind-mount path semantics (see `dockerManager.ts`'s
+ * `isBareWslDockerEngine`). Podman always maps to `'podman'`.
+ */
+export type EngineKind = 'docker-desktop' | 'docker-engine-wsl2' | 'podman';
+
 export interface ContainerRuntime {
   /** Which runtime was detected */
   kind: ContainerRuntimeKind;
@@ -32,6 +42,8 @@ export interface ContainerRuntime {
   bin: string;
   /** Display name for UI labels */
   displayName: string;
+  /** Finer-grained engine kind — see {@link EngineKind}. */
+  engineKind: EngineKind;
 }
 
 export interface DetectionResult {
@@ -253,11 +265,73 @@ const PODMAN_SOCKET_GUIDANCE =
   'Fix: run  systemctl --user enable --now podman.socket  — ' +
   'then click "Retry Detection" in the app.';
 
-function makeRuntime(kind: ContainerRuntimeKind): ContainerRuntime {
+/**
+ * True when `binPath` points at Docker Desktop's bundled `docker.exe`
+ * (`...\Docker\Docker\resources\bin\docker.exe`) rather than a standalone
+ * Docker CLI install (e.g. one shipped with a bare WSL2 Docker Engine setup,
+ * or `winget install Docker.DockerCLI`). Only meaningful on Windows.
+ */
+export function isDockerDesktopBinaryPath(
+  binPath: string | null,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform !== 'win32' || !binPath) return false;
+  return /\\Docker\\Docker\\resources\\bin\\docker(\.exe)?$/i.test(binPath.trim());
+}
+
+/**
+ * Resolve which Docker engine kind is active: Docker Desktop vs. a bare
+ * WSL2/remote Docker Engine reached over `DOCKER_HOST=tcp://...` (Issue #2).
+ *
+ * `DOCKER_HOST=tcp://...` alone is not a reliable WSL2 signal — Docker
+ * Desktop can also be pointed at a remote engine this way — so the two
+ * signals from the issue are combined: the host must be a `tcp://` URL AND
+ * (on Windows) the resolved `docker.exe` must NOT be the Desktop-bundled
+ * binary. Non-Windows platforms have no "Desktop vs bare engine" distinction
+ * to make here (native Linux/macOS daemons already speak POSIX paths).
+ */
+export function resolveDockerEngineKind(
+  platform: NodeJS.Platform,
+  dockerHost: string | undefined,
+  dockerBinPath: string | null,
+): Exclude<EngineKind, 'podman'> {
+  const isRemoteHost = /^tcp:\/\//i.test((dockerHost ?? '').trim());
+  if (platform === 'win32' && isRemoteHost && !isDockerDesktopBinaryPath(dockerBinPath, platform)) {
+    return 'docker-engine-wsl2';
+  }
+  return 'docker-desktop';
+}
+
+/**
+ * Best-effort resolution of the `docker` binary's on-disk path via
+ * `where`/`which`. Used only to distinguish Docker Desktop's bundled
+ * `docker.exe` from a standalone install (see `isDockerDesktopBinaryPath`).
+ * Returns null on any failure — callers treat that as "not Desktop-bundled".
+ */
+async function resolveDockerBinaryPath(): Promise<string | null> {
+  try {
+    const cmd = process.platform === 'win32' ? 'where' : 'which';
+    const out = await tryExec(cmd, ['docker']);
+    return out.split(/\r?\n/)[0]?.trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+async function makeRuntime(kind: ContainerRuntimeKind): Promise<ContainerRuntime> {
+  let engineKind: EngineKind = 'podman';
+  if (kind === 'docker') {
+    // The binary-path check only matters on win32 (the only platform where
+    // Docker Desktop vs. bare engine is ambiguous) — skip the extra
+    // subprocess call everywhere else.
+    const binPath = process.platform === 'win32' ? await resolveDockerBinaryPath() : null;
+    engineKind = resolveDockerEngineKind(process.platform, process.env.DOCKER_HOST, binPath);
+  }
   return {
     kind,
     bin: kind,
     displayName: kind === 'podman' ? 'Podman' : 'Docker',
+    engineKind,
   };
 }
 
@@ -270,11 +344,13 @@ function makeRuntime(kind: ContainerRuntimeKind): ContainerRuntime {
  *   3. Podman availability
  *   4. Binary-only presence for error messaging
  */
-export async function detectRuntime(): Promise<DetectionResult> {
-  // Check for env override
-  const override = process.env.CONTAINER_RUNTIME?.toLowerCase();
+export async function detectRuntime(forcedKind?: ContainerRuntimeKind): Promise<DetectionResult> {
+  // Check for an explicit param override first (Issue #2 — persisted UI
+  // engine-override setting), then fall back to the CONTAINER_RUNTIME env
+  // var (existing behavior, unchanged when no param is passed).
+  const override = forcedKind ?? process.env.CONTAINER_RUNTIME?.toLowerCase();
   if (override === 'docker' || override === 'podman') {
-    const runtime = makeRuntime(override);
+    const runtime = await makeRuntime(override);
     const running = await probeRuntime(override);
     console.log(
       `[ContainerRuntime] Override CONTAINER_RUNTIME=${override}, daemon ${running ? 'running' : 'not running'}`,
@@ -311,7 +387,7 @@ export async function detectRuntime(): Promise<DetectionResult> {
 
   // Try Docker first (most common)
   if (await probeRuntime('docker')) {
-    const runtime = makeRuntime('docker');
+    const runtime = await makeRuntime('docker');
     const hasCompose = await probeCompose('docker');
     console.log(
       `[ContainerRuntime] Docker daemon detected (compose: ${hasCompose ? 'yes' : 'no'})`,
@@ -345,7 +421,7 @@ export async function detectRuntime(): Promise<DetectionResult> {
         guidance: PODMAN_SOCKET_GUIDANCE,
       };
     }
-    const runtime = makeRuntime('podman');
+    const runtime = await makeRuntime('podman');
     const hasCompose = await probeCompose('podman');
     console.log(`[ContainerRuntime] Podman detected (compose: ${hasCompose ? 'yes' : 'no'})`);
     return {
@@ -384,12 +460,12 @@ let inflightDetection: Promise<DetectionResult> | null = null;
  * (it is only assigned after the first `await` resolves) and spawn their own
  * `<runtime> version` / `<runtime> compose version` subprocesses (GH #158).
  */
-export async function getDetectionResult(): Promise<DetectionResult> {
+export async function getDetectionResult(forcedKind?: ContainerRuntimeKind): Promise<DetectionResult> {
   if (cachedResult) return cachedResult;
   if (!inflightDetection) {
     inflightDetection = (async () => {
       try {
-        cachedResult = await detectRuntime();
+        cachedResult = await detectRuntime(forcedKind);
         return cachedResult;
       } finally {
         inflightDetection = null;

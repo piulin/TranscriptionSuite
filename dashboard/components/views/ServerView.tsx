@@ -1323,6 +1323,35 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
     api?.config?.set?.('server.gpuDevice', value)?.catch?.(() => {});
   }, []);
 
+  // Container engine picker (Issue #2). 'auto' defers to containerRuntime.ts's
+  // probe-based detection; the other values let a user correct a
+  // misclassification (force Podman, or fix a Docker Desktop / bare WSL2
+  // Docker Engine mixup). Persisted as electron-store key
+  // server.engineOverride. Changing it re-runs detection immediately via
+  // docker.retryDetection() so the effect is visible without an app restart —
+  // and, per Issue #2's acceptance criteria, the persisted value itself
+  // survives a real restart since it is read fresh from disk on every
+  // detection pass (readEngineOverrideFromStore in dockerManager.ts).
+  const [engineOverride, setEngineOverride] = useState<
+    'auto' | 'docker-desktop' | 'docker-engine-wsl2' | 'podman'
+  >('auto');
+  const handleEngineOverrideChange = useCallback(
+    (value: string): void => {
+      const next = value as 'auto' | 'docker-desktop' | 'docker-engine-wsl2' | 'podman';
+      setEngineOverride(next);
+      const api = (window as any).electronAPI;
+      api?.config?.set?.('server.engineOverride', next)?.catch?.(() => {});
+      docker.retryDetection();
+    },
+    [docker],
+  );
+  const ENGINE_KIND_LABELS: Record<string, string> = {
+    auto: 'Automatic',
+    'docker-desktop': 'Docker Desktop',
+    'docker-engine-wsl2': 'WSL2 Docker Engine',
+    podman: 'Podman',
+  };
+
   // ─── GPU Health Card state (NVIDIA Linux only) ─────────────────────────────
   // Phase 2 of the CUDA error 999 recovery plan. Three pieces of state feed the
   // GpuHealthCard rendered below the setup checklist:
@@ -1442,6 +1471,15 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
         .get('server.gpuDevice')
         .then((val: unknown) => {
           if (typeof val === 'string' && val) setGpuDevice(val);
+        })
+        .catch(() => {});
+      // Issue #2: hydrate the persisted container-engine override
+      api.config
+        .get('server.engineOverride')
+        .then((val: unknown) => {
+          if (val === 'docker-desktop' || val === 'docker-engine-wsl2' || val === 'podman') {
+            setEngineOverride(val);
+          }
         })
         .catch(() => {});
     } else {
@@ -2089,6 +2127,29 @@ export const ServerView: React.FC<ServerViewProps> = ({ onStartServer, startupFl
                   <p className="mt-2 text-xs text-slate-500 italic">
                     Slower transcription, no NVIDIA GPU required
                   </p>
+                )}
+                {/* Container engine picker (Issue #2): lets a user correct an
+                    auto-detection mixup — Docker Desktop vs. a bare WSL2 Docker
+                    Engine (docker.exe + DOCKER_HOST=tcp://...), or force Podman.
+                    Not shown for Metal, which never touches a container engine. */}
+                {runtimeProfile !== 'metal' && (
+                  <div className="mt-3">
+                    <p className="mb-1 text-xs font-medium text-slate-300">Container engine</p>
+                    <CustomSelect
+                      value={engineOverride}
+                      onChange={handleEngineOverrideChange}
+                      options={['auto', 'docker-desktop', 'docker-engine-wsl2', 'podman']}
+                      optionLabel={ENGINE_KIND_LABELS}
+                      disabled={isRunning}
+                      aria-label="Container engine"
+                      className="focus:ring-accent-cyan w-full max-w-sm rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-white transition-shadow outline-none hover:border-white/20 focus:ring-1"
+                    />
+                    <p className="mt-1 text-xs text-slate-500 italic">
+                      Active engine:{' '}
+                      {docker.engineKind ? ENGINE_KIND_LABELS[docker.engineKind] : 'Detecting…'}
+                      {engineOverride !== 'auto' ? ' (manual override)' : ''}
+                    </p>
+                  </div>
                 )}
               </div>
             </GlassCard>

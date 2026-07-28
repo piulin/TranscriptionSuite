@@ -1185,7 +1185,14 @@ describe('Multi-GPU selection', () => {
     await waitFor(() => {
       expect(pickerButton()).not.toBeNull();
     });
-    const labels = screen.getAllByRole('option').map((o) => o.textContent);
+    // Scoped to this picker's own Listbox wrapper (data-value from the mock
+    // above) — the Runtime Settings card also has a Container Engine picker
+    // (Issue #2), so an unscoped screen.getAllByRole('option') would pick up
+    // both selects' options.
+    const gpuPickerContainer = pickerButton()!.closest('[data-value]') as HTMLElement;
+    const labels = within(gpuPickerContainer)
+      .getAllByRole('option')
+      .map((o) => o.textContent);
     expect(labels).toEqual([
       'Automatic (Docker default)',
       'GPU 0: NVIDIA GeForce RTX 3060 (12 GB)',

@@ -83,6 +83,11 @@ export interface UseDockerReturn {
   loading: boolean;
   /** Detected runtime display name ('Docker' or 'Podman'), null if not detected */
   runtimeKind: string | null;
+  /**
+   * Finer-grained engine kind (Issue #2): 'docker-desktop', 'docker-engine-wsl2',
+   * or 'podman'. Null if not detected or not in Electron.
+   */
+  engineKind: 'docker-desktop' | 'docker-engine-wsl2' | 'podman' | null;
   /** Actionable guidance when detection fails (e.g. Podman socket not active) */
   detectionGuidance: string | null;
   /** Whether the compose plugin is available for the detected runtime */
@@ -176,6 +181,9 @@ export function useDocker(): UseDockerReturn {
   const [available, setAvailable] = useState(false);
   const [loading, setLoading] = useState(true);
   const [runtimeKind, setRuntimeKind] = useState<string | null>(null);
+  const [engineKind, setEngineKind] = useState<
+    'docker-desktop' | 'docker-engine-wsl2' | 'podman' | null
+  >(null);
   const [detectionGuidance, setDetectionGuidance] = useState<string | null>(null);
   const [composeAvailable, setComposeAvailable] = useState(true);
   const [images, setImages] = useState<DockerImage[]>([]);
@@ -222,6 +230,12 @@ export function useDocker(): UseDockerReturn {
             .getRuntimeKind()
             .then(setRuntimeKind)
             .catch(() => {});
+          if (docker.getEngineKind) {
+            docker
+              .getEngineKind()
+              .then(setEngineKind)
+              .catch(() => {});
+          }
           const [imgs, status, vols] = await Promise.all([
             docker.listImages(),
             docker.getContainerStatus(),
@@ -366,6 +380,12 @@ export function useDocker(): UseDockerReturn {
           .getRuntimeKind()
           .then(setRuntimeKind)
           .catch(() => {});
+        if (docker.getEngineKind) {
+          docker
+            .getEngineKind()
+            .then(setEngineKind)
+            .catch(() => {});
+        }
         const [imgs, status, vols] = await Promise.all([
           docker.listImages(),
           docker.getContainerStatus(),
@@ -626,6 +646,7 @@ export function useDocker(): UseDockerReturn {
     available,
     loading,
     runtimeKind,
+    engineKind,
     detectionGuidance,
     composeAvailable,
     images,

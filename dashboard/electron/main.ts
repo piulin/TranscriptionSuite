@@ -535,6 +535,12 @@ const store = new Store({
     // time by dockerManager.startContainer(). Set from the Runtime Settings
     // GPU picker, which only appears when >1 NVIDIA GPU is detected.
     'server.gpuDevice': 'auto',
+    // Issue #2 — manual container-engine override. 'auto' defers to
+    // containerRuntime.ts's probe-based detection; the other three values let
+    // a user correct a misclassification (e.g. force Podman even though
+    // docker.exe also auto-detects, or fix a Docker Desktop / bare WSL2
+    // Docker Engine mixup) from the Runtime Settings engine picker.
+    'server.engineOverride': 'auto',
     // Issue #83 — opt-in legacy-GPU image variant (Pascal/Maxwell support).
     // Default false keeps behaviour unchanged for existing users. When true,
     // the dashboard uses the `-legacy` GHCR repo for list/pull/tag operations.
@@ -1192,6 +1198,10 @@ ipcMain.handle('docker:retryDetection', async () => {
 
 ipcMain.handle('docker:getRuntimeKind', async () => {
   return dockerManager.getRuntimeKind();
+});
+
+ipcMain.handle('docker:getEngineKind', async () => {
+  return dockerManager.getEngineKind();
 });
 
 ipcMain.handle('docker:getDetectionGuidance', async () => {
