@@ -143,6 +143,12 @@ folder instead.)
 On Linux/macOS the equivalent is any directory containing your CA:
 `EXTRA_CA_CERTS_DIR=~/.config/TranscriptionSuite/ca`.
 
+Running a bare Docker Engine inside WSL2 (no Docker Desktop, reached via
+`DOCKER_HOST=tcp://...`)? The dashboard only translates the paths it builds
+itself (config dir, TLS certs, startup events) to their `/mnt/c/...` WSL2
+equivalent. `EXTRA_CA_CERTS_DIR` is a value you type in yourself, so supply
+the WSL2-shaped path directly, e.g. `EXTRA_CA_CERTS_DIR=/mnt/c/Users/<you>/AppData/Roaming/TranscriptionSuite/ca`.
+
 Accepted file extensions are `.crt`, `.pem` and `.cer`; PEM bundles holding many
 certificates are split automatically. Files that are not PEM (a DER export) are
 skipped with a warning rather than corrupting the trust store.
