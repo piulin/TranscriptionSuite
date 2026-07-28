@@ -735,6 +735,97 @@ function getComposeDir(): string {
   return composeDir;
 }
 
+// ─── Bare WSL2 Docker Engine Path Translation (Issue #1) ───────────────────
+// A bare Docker Engine running inside a WSL2 distro (no Docker Desktop) is
+// reached from Windows via native docker.exe over DOCKER_HOST=tcp://... —
+// the only way to run the server on Windows without Docker Desktop's
+// licensing. Docker Desktop silently rewrites Windows host paths into the
+// Linux VM's mount namespace for bind mounts; a bare engine has no such
+// layer, so every path built from Windows-side APIs (app.getPath(),
+// os.tmpdir(), etc.) must be translated to its /mnt/c/... WSL2 equivalent
+// before it reaches compose, or `docker compose up` fails with
+// `invalid volume specification`.
+
+/**
+ * Detect whether the active connection is a bare Docker Engine reached over
+ * `DOCKER_HOST=tcp://...`, as opposed to Docker Desktop (named pipe, no
+ * DOCKER_HOST needed) or a native Linux/macOS daemon (already POSIX paths,
+ * no translation needed regardless of DOCKER_HOST). Only meaningful on
+ * win32 — that's the only platform where host paths are built in a shape
+ * the Linux daemon can't consume directly.
+ */
+export function isBareWslDockerEngine(
+  platform: NodeJS.Platform = process.platform,
+  dockerHost: string | undefined = process.env.DOCKER_HOST,
+): boolean {
+  return platform === 'win32' && /^tcp:\/\//i.test((dockerHost ?? '').trim());
+}
+
+/**
+ * Translate a Windows-style absolute path (`C:\Users\...` or `C:/Users/...`)
+ * to its WSL2 mount-point equivalent (`/mnt/c/Users/...`). Paths that are not
+ * `<drive>:...`-shaped pass through unchanged — callers gate this behind
+ * `isBareWslDockerEngine()` so it only ever runs when it's actually needed.
+ */
+export function windowsPathToWslMountPath(hostPath: string): string {
+  const match = /^([A-Za-z]):[\\/](.*)$/.exec(hostPath);
+  if (!match) return hostPath;
+  const [, drive, rest] = match;
+  return `/mnt/${drive.toLowerCase()}/${rest.replace(/\\/g, '/')}`;
+}
+
+/**
+ * Translate a host bind-mount path for the compose env, but only when the
+ * active engine actually needs it (bare WSL2 Docker Engine). Docker Desktop
+ * and native Linux/macOS daemons receive the path unchanged.
+ */
+export function toComposeMountPath(hostPath: string, isBareEngine: boolean): string {
+  return isBareEngine ? windowsPathToWslMountPath(hostPath) : hostPath;
+}
+
+/**
+ * Resolve the five bind-mount env vars that `startContainer` writes into the
+ * compose env, applying WSL2 path translation where needed and — per
+ * Issue #1 — always emitting an explicit absolute path to the `.empty`
+ * sentinel (created by `resolveComposeDir()`) for the optional TLS cert/key
+ * mounts when the caller hasn't configured them, instead of leaving them
+ * unset for compose's own `${VAR:-./.empty}` relative-path fallback to
+ * resolve (which a bare WSL2 Docker Engine resolves against the Windows-side
+ * compose file location, handing the daemon a Windows path even for mounts
+ * nobody configured).
+ *
+ * `extraCaCertsDir`, when present, is a user-supplied value (GH-200 escape
+ * hatch) and is passed through untouched — see `upsertComposeEnvValues()`.
+ * A user running a bare WSL2 Docker Engine must supply an already-WSL-shaped
+ * (`/mnt/c/...`) path themselves; we don't own this value so we don't
+ * auto-translate it.
+ */
+export function resolveBindMountPaths(inputs: {
+  userConfigDir: string;
+  startupEventsDir: string;
+  tlsCertPath?: string;
+  tlsKeyPath?: string;
+  extraCaCertsDir?: string;
+  composeDir: string;
+  isBareEngine: boolean;
+}): {
+  USER_CONFIG_DIR: string;
+  STARTUP_EVENTS_DIR: string;
+  TLS_CERT_PATH: string;
+  TLS_KEY_PATH: string;
+  EXTRA_CA_CERTS_DIR: string;
+} {
+  const translate = (p: string) => toComposeMountPath(p, inputs.isBareEngine);
+  const emptySentinelPath = path.join(inputs.composeDir, '.empty');
+  return {
+    USER_CONFIG_DIR: translate(inputs.userConfigDir),
+    STARTUP_EVENTS_DIR: translate(inputs.startupEventsDir),
+    TLS_CERT_PATH: translate(inputs.tlsCertPath || emptySentinelPath),
+    TLS_KEY_PATH: translate(inputs.tlsKeyPath || emptySentinelPath),
+    EXTRA_CA_CERTS_DIR: inputs.extraCaCertsDir || translate(emptySentinelPath),
+  };
+}
+
 // Keep in sync with src/types/runtime.ts (canonical) and src/types/electron.d.ts
 /**
  * Runtime profile: GPU (NVIDIA CUDA), Vulkan (AMD/Intel GPU on Linux DRI),
@@ -2360,16 +2451,24 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
   // compose variable interpolation (port mapping) and container env override.
   composeEnv['SERVER_PORT'] = String(readPortFromStore());
 
+  // Raw (untranslated) TLS cert/key host paths — finalized together with the
+  // other bind-mount paths below via resolveBindMountPaths(), which also
+  // applies WSL2 translation and the always-explicit .empty fallback.
+  let rawTlsCertPath: string | undefined;
+  let rawTlsKeyPath: string | undefined;
+
   if (mode === 'remote') {
     composeEnv['TLS_ENABLED'] = 'true';
 
-    // Resolve host TLS certificate paths and pass them to docker-compose so
-    // the bind mounts (${TLS_CERT_PATH}:/certs/cert.crt:ro etc.) resolve to
-    // real files instead of the .empty sentinel directory.
-    if (!tlsEnv?.TLS_CERT_PATH || !tlsEnv?.TLS_KEY_PATH) {
+    // Resolve host TLS certificate paths so the bind mounts
+    // (${TLS_CERT_PATH}:/certs/cert.crt:ro etc.) resolve to real files
+    // instead of the .empty sentinel directory.
+    rawTlsCertPath = tlsEnv?.TLS_CERT_PATH;
+    rawTlsKeyPath = tlsEnv?.TLS_KEY_PATH;
+    if (!rawTlsCertPath || !rawTlsKeyPath) {
       const tls = resolveTlsCertPaths();
-      composeEnv['TLS_CERT_PATH'] = tls.certPath;
-      composeEnv['TLS_KEY_PATH'] = tls.keyPath;
+      rawTlsCertPath = tls.certPath;
+      rawTlsKeyPath = tls.keyPath;
     }
   } else {
     // Explicitly write false so a stale 'true' from a previous remote start
@@ -2626,7 +2725,6 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
   // Truncate any stale events file from a previous session
   const eventsFile = path.join(eventsDir, 'startup-events.jsonl');
   fs.writeFileSync(eventsFile, '', { encoding: 'utf-8', mode: 0o600 });
-  composeEnv['STARTUP_EVENTS_DIR'] = eventsDir;
   _startupEventsFilePath = eventsFile;
 
   // Mount the user's config.yaml into the container so dashboard-edited
@@ -2638,7 +2736,28 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
   // onto its defaults; env bridges (MAIN_TRANSCRIBER_MODEL, etc.) still win. The
   // compose volume `${USER_CONFIG_DIR:-./.empty}:/user-config` resolves here.
   ensureServerConfigSeed();
-  composeEnv['USER_CONFIG_DIR'] = getServerConfigDir();
+
+  // Finalize every bind-mount env var in one place: applies WSL2 path
+  // translation for a bare WSL2 Docker Engine (Issue #1) and always emits an
+  // explicit absolute .empty-sentinel path for the optional TLS mounts
+  // instead of leaving them to compose's relative-path fallback.
+  const userCaCertsDir =
+    tlsEnv?.EXTRA_CA_CERTS_DIR ||
+    process.env.EXTRA_CA_CERTS_DIR ||
+    readComposeEnvValue('EXTRA_CA_CERTS_DIR') ||
+    undefined;
+  Object.assign(
+    composeEnv,
+    resolveBindMountPaths({
+      userConfigDir: getServerConfigDir(),
+      startupEventsDir: eventsDir,
+      tlsCertPath: rawTlsCertPath,
+      tlsKeyPath: rawTlsKeyPath,
+      extraCaCertsDir: userCaCertsDir,
+      composeDir: getComposeDir(),
+      isBareEngine: isBareWslDockerEngine(),
+    }),
+  );
 
   // Rotate the persistent server log — adds a session marker and trims old sessions.
   rotateServerLog();
