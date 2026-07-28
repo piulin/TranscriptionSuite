@@ -146,6 +146,7 @@ export interface ElectronAPI {
     available: () => Promise<boolean>;
     retryDetection: () => Promise<boolean>;
     getRuntimeKind: () => Promise<string | null>;
+    getEngineKind: () => Promise<'docker-desktop' | 'docker-engine-wsl2' | 'podman' | null>;
     getDetectionGuidance: () => Promise<string | null>;
     getComposeAvailable: () => Promise<boolean>;
     checkGpu: () => Promise<{
@@ -553,6 +554,10 @@ contextBridge.exposeInMainWorld('electronAPI', {
     available: () => ipcRenderer.invoke('docker:available'),
     retryDetection: () => ipcRenderer.invoke('docker:retryDetection'),
     getRuntimeKind: () => ipcRenderer.invoke('docker:getRuntimeKind') as Promise<string | null>,
+    getEngineKind: () =>
+      ipcRenderer.invoke('docker:getEngineKind') as Promise<
+        'docker-desktop' | 'docker-engine-wsl2' | 'podman' | null
+      >,
     getDetectionGuidance: () =>
       ipcRenderer.invoke('docker:getDetectionGuidance') as Promise<string | null>,
     getComposeAvailable: () => ipcRenderer.invoke('docker:getComposeAvailable') as Promise<boolean>,

@@ -30,6 +30,7 @@ import {
 } from './serverConfigPaths.js';
 import {
   type ContainerRuntimeKind,
+  type EngineKind,
   getRuntimeBin,
   getContainerRuntime,
   getDetectionResult,
@@ -125,6 +126,44 @@ export function readGpuDeviceFromStore(): string {
     const data = JSON.parse(raw) as Record<string, unknown>;
     const value = data['server.gpuDevice'];
     return typeof value === 'string' && value ? value : 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+/**
+ * Manual container-engine override (Issue #2). Lets a user correct
+ * auto-detection when it picks the wrong engine — e.g. force Podman even
+ * though `docker.exe` + `DOCKER_HOST` also auto-detects successfully, or
+ * correct a Docker Desktop vs. bare WSL2 Docker Engine misclassification.
+ * `'auto'` (default) defers entirely to containerRuntime.ts's probe-based
+ * detection.
+ */
+export type EngineOverride = 'auto' | 'docker-desktop' | 'docker-engine-wsl2' | 'podman';
+
+const ENGINE_OVERRIDE_VALUES: readonly EngineOverride[] = [
+  'auto',
+  'docker-desktop',
+  'docker-engine-wsl2',
+  'podman',
+];
+
+function isEngineOverride(value: unknown): value is EngineOverride {
+  return typeof value === 'string' && (ENGINE_OVERRIDE_VALUES as readonly string[]).includes(value);
+}
+
+/**
+ * Read the persisted `server.engineOverride` selection from the electron-store
+ * JSON file on disk. Defaults to `'auto'` when the file is missing, the key is
+ * absent, or the value is invalid — matches the config store default.
+ */
+export function readEngineOverrideFromStore(): EngineOverride {
+  try {
+    const storePath = path.join(app.getPath('userData'), 'dashboard-config.json');
+    const raw = fs.readFileSync(storePath, 'utf8');
+    const data = JSON.parse(raw) as Record<string, unknown>;
+    const value = data['server.engineOverride'];
+    return isEngineOverride(value) ? value : 'auto';
   } catch {
     return 'auto';
   }
@@ -753,11 +792,19 @@ function getComposeDir(): string {
  * no translation needed regardless of DOCKER_HOST). Only meaningful on
  * win32 — that's the only platform where host paths are built in a shape
  * the Linux daemon can't consume directly.
+ *
+ * `engineOverride` (Issue #2's persisted `server.engineOverride` setting)
+ * takes precedence over the auto-detected signal: a user who has manually
+ * classified their engine as Docker Desktop or a bare WSL2 Engine should not
+ * have that choice second-guessed by the DOCKER_HOST heuristic.
  */
 export function isBareWslDockerEngine(
   platform: NodeJS.Platform = process.platform,
   dockerHost: string | undefined = process.env.DOCKER_HOST,
+  engineOverride: EngineOverride = 'auto',
 ): boolean {
+  if (engineOverride === 'docker-engine-wsl2') return true;
+  if (engineOverride === 'docker-desktop' || engineOverride === 'podman') return false;
   return platform === 'win32' && /^tcp:\/\//i.test((dockerHost ?? '').trim());
 }
 
@@ -1624,8 +1671,20 @@ let _composeAvailable: boolean | null = null;
  *
  * All stages log diagnostics to the main-process console for debugging.
  */
+/**
+ * Translate the persisted `server.engineOverride` (Issue #2) into the
+ * `forcedKind` param `getDetectionResult()`/`detectRuntime()` accept. Only
+ * the `'podman'` override changes which runtime is actually probed/used —
+ * `'docker-desktop'` and `'docker-engine-wsl2'` both still resolve to
+ * `kind: 'docker'` (they only disambiguate the docker sub-kind, applied via
+ * `getEngineKind()` and `isBareWslDockerEngine()` instead).
+ */
+function forcedRuntimeKindFromEngineOverride(): ContainerRuntimeKind | undefined {
+  return readEngineOverrideFromStore() === 'podman' ? 'podman' : undefined;
+}
+
 async function dockerAvailable(): Promise<boolean> {
-  const result = await getDetectionResult();
+  const result = await getDetectionResult(forcedRuntimeKindFromEngineOverride());
 
   _detectionGuidance = result.guidance ?? null;
   _composeAvailable = result.composeAvailable ?? null;
@@ -2755,7 +2814,7 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
       tlsKeyPath: rawTlsKeyPath,
       extraCaCertsDir: userCaCertsDir,
       composeDir: getComposeDir(),
-      isBareEngine: isBareWslDockerEngine(),
+      isBareEngine: isBareWslDockerEngine(process.platform, process.env.DOCKER_HOST, readEngineOverrideFromStore()),
     }),
   );
 
@@ -4720,12 +4779,29 @@ async function getRuntimeKind(): Promise<string | null> {
   return runtime?.displayName ?? null;
 }
 
+/**
+ * Get the effective engine kind for UI display (Issue #2) — Docker Desktop,
+ * WSL2 Docker Engine, or Podman. Applies the persisted `server.engineOverride`
+ * on top of the auto-detected value when it targets a docker sub-kind, so a
+ * corrected classification is reflected immediately without waiting on a
+ * code fix.
+ */
+async function getEngineKind(): Promise<EngineKind | null> {
+  const runtime = await getContainerRuntime();
+  if (!runtime) return null;
+  if (runtime.kind === 'podman') return 'podman';
+  const override = readEngineOverrideFromStore();
+  if (override === 'docker-desktop' || override === 'docker-engine-wsl2') return override;
+  return runtime.engineKind;
+}
+
 export const dockerManager = {
   dockerAvailable,
   getDetectionGuidance,
   getComposeAvailable,
   retryDetection,
   getRuntimeKind,
+  getEngineKind,
   checkGpu,
   resetGpuCache,
   runGpuPreflight,

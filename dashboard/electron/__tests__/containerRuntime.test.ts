@@ -46,6 +46,8 @@ import {
   resetDetection,
   getRuntimePathAdditions,
   getDetectionResult,
+  isDockerDesktopBinaryPath,
+  resolveDockerEngineKind,
 } from '../containerRuntime.js';
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -132,6 +134,8 @@ describe('[P1] detectRuntime', () => {
     expect(result.runtime!.displayName).toBe('Docker');
     expect(result.binaryFoundButNotRunning).toBe(false);
     expect(result.composeAvailable).toBe(true);
+    // Issue #2: no DOCKER_HOST set → classified as Docker Desktop.
+    expect(result.runtime!.engineKind).toBe('docker-desktop');
   });
 
   it('Docker running but compose missing: runtime set, guidance provided', async () => {
@@ -163,6 +167,8 @@ describe('[P1] detectRuntime', () => {
     expect(result.runtime!.bin).toBe('podman');
     expect(result.runtime!.displayName).toBe('Podman');
     expect(result.composeAvailable).toBe(true);
+    // Issue #2: Podman always maps to the 'podman' engine kind.
+    expect(result.runtime!.engineKind).toBe('podman');
   });
 
   // ── Scenario 3: Neither available ─────────────────────────────────────
@@ -235,6 +241,151 @@ describe('[P1] detectRuntime', () => {
     setExecResponses({});
     const second = await detectRuntime();
     expect(second.runtime).toBeNull();
+  });
+});
+
+// ─── Issue #2: WSL2 bare Docker Engine vs. Docker Desktop ───────────────────
+//
+// A bare Docker Engine running inside a WSL2 distro (no Docker Desktop) is
+// reached from Windows via `docker.exe` over `DOCKER_HOST=tcp://...`. Both
+// signals — the env var AND a non-Desktop-bundled docker.exe path — must
+// agree before detectRuntime() classifies the engine as 'docker-engine-wsl2';
+// otherwise it defaults to 'docker-desktop' (unchanged pre-Issue-#2 behavior).
+
+describe('[Issue #2] detectRuntime — engine kind classification', () => {
+  const DESKTOP_DOCKER_EXE = 'C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe';
+  const STANDALONE_DOCKER_EXE = 'C:\\ProgramData\\DockerCLI\\docker.exe';
+
+  it('classifies as docker-engine-wsl2 on Windows with DOCKER_HOST=tcp://... and a non-Desktop docker.exe', async () => {
+    setPlatform('win32');
+    process.env.DOCKER_HOST = 'tcp://localhost:2375';
+    setExecResponses({
+      'docker version': '24.0.7',
+      'docker compose version': 'v2',
+      'where docker': STANDALONE_DOCKER_EXE,
+    });
+
+    const result = await detectRuntime();
+
+    expect(result.runtime).not.toBeNull();
+    expect(result.runtime!.kind).toBe('docker');
+    expect(result.runtime!.engineKind).toBe('docker-engine-wsl2');
+  });
+
+  it('classifies as docker-desktop on Windows with a tcp:// DOCKER_HOST when docker.exe IS the Desktop bundle', async () => {
+    setPlatform('win32');
+    process.env.DOCKER_HOST = 'tcp://localhost:2375';
+    setExecResponses({
+      'docker version': '24.0.7',
+      'docker compose version': 'v2',
+      'where docker': DESKTOP_DOCKER_EXE,
+    });
+
+    const result = await detectRuntime();
+
+    expect(result.runtime!.engineKind).toBe('docker-desktop');
+  });
+
+  it('classifies as docker-desktop on Windows with no DOCKER_HOST (Docker Desktop default)', async () => {
+    setPlatform('win32');
+    setExecResponses({
+      'docker version': '24.0.7',
+      'docker compose version': 'v2',
+      'where docker': DESKTOP_DOCKER_EXE,
+    });
+
+    const result = await detectRuntime();
+
+    expect(result.runtime!.engineKind).toBe('docker-desktop');
+  });
+
+  it('never classifies as docker-engine-wsl2 on Linux, even with a tcp:// DOCKER_HOST', async () => {
+    setPlatform('linux');
+    process.env.DOCKER_HOST = 'tcp://localhost:2375';
+    setExecResponses({
+      'docker version': '24.0.7',
+      'docker compose version': 'v2',
+    });
+
+    const result = await detectRuntime();
+
+    expect(result.runtime!.engineKind).toBe('docker-desktop');
+  });
+
+  it('never classifies as docker-engine-wsl2 on macOS, even with a tcp:// DOCKER_HOST', async () => {
+    setPlatform('darwin');
+    process.env.DOCKER_HOST = 'tcp://localhost:2375';
+    setExecResponses({
+      'docker version': '24.0.7',
+      'docker compose version': 'v2',
+    });
+
+    const result = await detectRuntime();
+
+    expect(result.runtime!.engineKind).toBe('docker-desktop');
+  });
+});
+
+describe('[Issue #2] isDockerDesktopBinaryPath', () => {
+  it('true for the Desktop-bundled docker.exe path on Windows', () => {
+    expect(
+      isDockerDesktopBinaryPath(
+        'C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe',
+        'win32',
+      ),
+    ).toBe(true);
+  });
+
+  it('false for a standalone docker.exe install on Windows', () => {
+    expect(isDockerDesktopBinaryPath('C:\\ProgramData\\DockerCLI\\docker.exe', 'win32')).toBe(
+      false,
+    );
+  });
+
+  it('false for null binPath', () => {
+    expect(isDockerDesktopBinaryPath(null, 'win32')).toBe(false);
+  });
+
+  it('false on non-Windows platforms regardless of path', () => {
+    expect(
+      isDockerDesktopBinaryPath(
+        '/Applications/Docker.app/Contents/Resources/bin/docker',
+        'darwin',
+      ),
+    ).toBe(false);
+  });
+});
+
+describe('[Issue #2] resolveDockerEngineKind', () => {
+  it('docker-engine-wsl2: win32 + tcp:// host + non-Desktop binary', () => {
+    expect(
+      resolveDockerEngineKind('win32', 'tcp://localhost:2375', 'C:\\ProgramData\\DockerCLI\\docker.exe'),
+    ).toBe('docker-engine-wsl2');
+  });
+
+  it('docker-desktop: win32 + no DOCKER_HOST', () => {
+    expect(resolveDockerEngineKind('win32', undefined, null)).toBe('docker-desktop');
+  });
+
+  it('docker-desktop: win32 + named-pipe DOCKER_HOST', () => {
+    expect(resolveDockerEngineKind('win32', 'npipe:////./pipe/docker_engine', null)).toBe(
+      'docker-desktop',
+    );
+  });
+
+  it('docker-desktop: win32 + tcp:// host but Desktop-bundled binary', () => {
+    expect(
+      resolveDockerEngineKind(
+        'win32',
+        'tcp://localhost:2375',
+        'C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe',
+      ),
+    ).toBe('docker-desktop');
+  });
+
+  it('docker-desktop: non-Windows platforms regardless of DOCKER_HOST', () => {
+    expect(resolveDockerEngineKind('linux', 'tcp://localhost:2375', null)).toBe('docker-desktop');
+    expect(resolveDockerEngineKind('darwin', 'tcp://localhost:2375', null)).toBe('docker-desktop');
   });
 });
 

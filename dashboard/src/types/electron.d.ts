@@ -136,6 +136,7 @@ interface ElectronAPI {
     available: () => Promise<boolean>;
     retryDetection: () => Promise<boolean>;
     getRuntimeKind: () => Promise<string | null>;
+    getEngineKind: () => Promise<'docker-desktop' | 'docker-engine-wsl2' | 'podman' | null>;
     getDetectionGuidance: () => Promise<string | null>;
     getComposeAvailable: () => Promise<boolean>;
     checkGpu: () => Promise<{
