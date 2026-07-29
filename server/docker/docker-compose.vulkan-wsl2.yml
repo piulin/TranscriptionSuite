@@ -88,3 +88,8 @@ services:
     depends_on:
       whisper-server:
         condition: service_started
+    # Required for host.docker.internal:8080 (WHISPERCPP_SERVER_URL, see
+    # dockerManager.ts) to resolve under a bare Docker Engine; host-gateway is
+    # a compatible no-op under Docker Desktop.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

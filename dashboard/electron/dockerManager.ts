@@ -873,6 +873,74 @@ export function resolveBindMountPaths(inputs: {
   };
 }
 
+// ─── Bare WSL2 Docker Engine Host Reachability (Issue #3) ──────────────────
+// `extra_hosts: host.docker.internal:host-gateway` (docker-compose.desktop-vm.yml,
+// docker-compose.vulkan-wsl2.yml) resolves to whatever machine is running the
+// Docker engine. Under Docker Desktop and native Linux/macOS that IS the
+// machine LM Studio / whisper-server.exe run on. Under a bare Docker Engine
+// running inside a WSL2 distro (Issue #2's 'docker-engine-wsl2'), the engine's
+// own host is the WSL2 Linux VM — a container's `host.docker.internal` lands
+// on the VM's docker0 bridge gateway, not on Windows. LM Studio and the native
+// whisper-server.exe sidecar run on Windows, one hop further out, reachable
+// from inside the VM only via its own default-route gateway. That address is
+// assigned per-machine/per-boot by the Hyper-V virtual switch, so it must be
+// read live rather than hardcoded.
+
+/**
+ * Parse the Linux kernel's `/proc/net/route` table for the default route's
+ * gateway address. The kernel encodes each IPv4 field as little-endian hex,
+ * so the byte order is reversed relative to dotted-quad notation.
+ * Returns null if there is no default route (`Destination` all zero) or the
+ * text doesn't parse.
+ */
+export function parseDefaultGatewayFromProcNetRoute(procNetRoute: string): string | null {
+  const lines = procNetRoute.split(/\r?\n/).slice(1); // drop the header row
+  for (const line of lines) {
+    const fields = line.trim().split(/\s+/);
+    const [, destination, gateway] = fields;
+    if (destination !== '00000000' || !gateway || gateway === '00000000') continue;
+    const bytes = gateway.match(/../g);
+    if (!bytes || bytes.length !== 4) continue;
+    return bytes
+      .reverse()
+      .map((hex) => parseInt(hex, 16))
+      .join('.');
+  }
+  return null;
+}
+
+/**
+ * Resolve the Windows host's IP address as seen from inside a bare WSL2
+ * Docker Engine, by reading the default route from the engine's own network
+ * namespace (`--network host`) via a throwaway container on the already
+ * locally-present server `image` — mirrors the existing `docker run
+ * --entrypoint /bin/sh` pattern in `checkModelsCachedOffline`, so no extra
+ * image pull is introduced. Returns null on any failure; callers must fall
+ * back to `host.docker.internal` rather than fail the whole server start
+ * over a reachability nicety.
+ */
+async function resolveBareEngineWindowsHostIp(image: string): Promise<string | null> {
+  try {
+    const bin = await runtimeBin();
+    const output = await exec(
+      bin,
+      ['run', '--rm', '--network', 'host', '--entrypoint', '/bin/sh', image, '-c', 'cat /proc/net/route'],
+      // A reachability nicety, not a hard requirement — fail fast into the
+      // host.docker.internal fallback instead of the default 2-minute exec()
+      // timeout stalling server start.
+      { timeoutMs: 15_000 },
+    );
+    return parseDefaultGatewayFromProcNetRoute(output);
+  } catch (err: any) {
+    console.warn(
+      '[DockerManager] Could not resolve the Windows host IP from the bare WSL2 Docker Engine — ' +
+        'falling back to host.docker.internal:',
+      err.message,
+    );
+    return null;
+  }
+}
+
 // Keep in sync with src/types/runtime.ts (canonical) and src/types/electron.d.ts
 /**
  * Runtime profile: GPU (NVIDIA CUDA), Vulkan (AMD/Intel GPU on Linux DRI),
@@ -2510,6 +2578,29 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
   // compose variable interpolation (port mapping) and container env override.
   composeEnv['SERVER_PORT'] = String(readPortFromStore());
 
+  // Bare WSL2 Docker Engine (Issue #2/#3): resolve once, up front, so both the
+  // LM Studio default and the vulkan-wsl2 whisper-server URL below can use the
+  // real Windows host IP instead of host.docker.internal (which resolves to
+  // the WSL2 VM itself under this engine kind — see the "Bare WSL2 Docker
+  // Engine Host Reachability" section above). null on Desktop/Linux/failure;
+  // callers fall back to the existing host.docker.internal default.
+  const isBareEngine = isBareWslDockerEngine(
+    process.platform,
+    process.env.DOCKER_HOST,
+    readEngineOverrideFromStore(),
+  );
+  const bareEngineHostIp = isBareEngine
+    ? await resolveBareEngineWindowsHostIp(`${imageRepoForSession}:${resolvedTag}`)
+    : null;
+
+  // LM Studio integration (docker-compose.desktop-vm.yml default:
+  // `${LM_STUDIO_URL:-http://host.docker.internal:1234}`). Only override when
+  // the user hasn't already exported their own LM_STUDIO_URL — that explicit
+  // choice must keep winning, same as before this fix.
+  if (bareEngineHostIp && !process.env.LM_STUDIO_URL) {
+    composeEnv['LM_STUDIO_URL'] = `http://${bareEngineHostIp}:1234`;
+  }
+
   // Raw (untranslated) TLS cert/key host paths — finalized together with the
   // other bind-mount paths below via resolveBindMountPaths(), which also
   // applies WSL2 translation and the always-explicit .empty fallback.
@@ -2711,11 +2802,15 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
   // Vulkan profiles: set whisper-server URL and optional GGML model path.
   // vulkan (Linux): host-network mode → localhost; bridge elsewhere → Docker DNS.
   // vulkan-wsl2 (Windows): whisper-server.exe runs natively on the Windows host,
-  //   reachable from inside Docker Desktop bridge via host.docker.internal.
+  //   reachable from inside Docker Desktop bridge via host.docker.internal —
+  //   or, under a bare WSL2 Docker Engine, via the resolved bareEngineHostIp
+  //   (host.docker.internal resolves to the WSL2 VM there, not Windows).
   if (runtimeProfile === 'vulkan' || runtimeProfile === 'vulkan-wsl2') {
     let serverUrl: string;
     if (runtimeProfile === 'vulkan-wsl2') {
-      serverUrl = 'http://host.docker.internal:8080';
+      serverUrl = bareEngineHostIp
+        ? `http://${bareEngineHostIp}:8080`
+        : 'http://host.docker.internal:8080';
     } else {
       serverUrl =
         process.platform === 'linux' ? 'http://localhost:8080' : 'http://whisper-server:8080';
@@ -2814,7 +2909,7 @@ async function startContainer(options: StartContainerOptions): Promise<string> {
       tlsKeyPath: rawTlsKeyPath,
       extraCaCertsDir: userCaCertsDir,
       composeDir: getComposeDir(),
-      isBareEngine: isBareWslDockerEngine(process.platform, process.env.DOCKER_HOST, readEngineOverrideFromStore()),
+      isBareEngine,
     }),
   );
 
